@@ -1,0 +1,4 @@
+accelerator: "auto"   # or "cpu"/"gpu"
+devices: 1            # or "auto" / list / int depending on your setup
+precision: 32
+max_epochs: 100

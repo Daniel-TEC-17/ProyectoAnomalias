@@ -1,0 +1,19 @@
+
+
+name: "sgd"
+learning_rate: 0.001
+momentum: 0.9
+weight_decay: 0.0001
+nesterov: true
+
+scheduler:
+  name: "plateau"
+  enabled: true
+  
+  # Parámetros para ReduceLROnPlateau
+  mode: "min"
+  factor: 0.5
+  patience: 5
+  threshold: 0.0001
+  min_lr: 1.0e-6
+  

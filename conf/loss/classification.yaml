@@ -1,0 +1,5 @@
+
+name: "cross_entropy"
+type: "classification"
+label_smoothing: 0.0  
+weight: null

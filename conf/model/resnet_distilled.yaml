@@ -1,0 +1,20 @@
+defaults:
+  - /loss: distillation
+  - /optimizer: adam
+
+
+latent_dim: 128
+dropout: 0.3
+use_batch_norm: true
+learning_rate: 0.001  
+weight_decay: 0.0001
+batch_size: 32
+
+# Teacher model (ResNet-18 preentrenado)
+teacher_model: "resnet18"
+teacher_weights: "IMAGENET1K_V1"
+freeze_teacher: true
+
+# Entrenamiento
+max_epochs: 100
+

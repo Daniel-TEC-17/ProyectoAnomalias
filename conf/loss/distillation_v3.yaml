@@ -1,0 +1,9 @@
+
+name: "distillation_v3"
+type: "teacher_student"
+
+temperature: 7.0
+alpha: 0.4
+beta: 0.4    # Balance entre hard y soft
+gamma: 0.2
+label_smoothing: 0.0

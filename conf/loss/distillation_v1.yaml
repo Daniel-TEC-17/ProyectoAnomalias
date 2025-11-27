@@ -1,0 +1,11 @@
+
+
+name: "distillation_v1"
+type: "teacher_student"
+
+temperature: 3.0
+alpha: 0.5   # Mayor peso en hard loss
+beta: 0.3
+gamma: 0.2
+label_smoothing: 0.0
+  

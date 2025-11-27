@@ -1,0 +1,19 @@
+defaults:
+  - /loss: classification
+  - /optimizer: adam
+
+
+name: "resnet_scratch"
+type: "scratch"
+  
+# Arquitectura
+latent_dim: 128  # Dimensión del espacio latente (embedding)
+dropout: 0.3
+use_batch_norm: true
+learning_rate: 0.001  
+weight_decay: 0.0001
+batch_size: 32
+
+# Entrenamiento
+max_epochs: 100
+  
