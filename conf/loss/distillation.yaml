@@ -1,13 +1,7 @@
-
-  name: "distillation"
+name: "distillation"
 type: "teacher_student"
-
 temperature: 5.0
-
-alpha: 0.3   # Hard loss (CrossEntropy)
-beta: 0.5    # Soft loss (KL Divergence)
-gamma: 0.2   # Feature loss (MSE embeddings)
-
-# Parámetros adicionales
-label_smoothing: 0.0  
-  
+alpha: 0.3
+beta: 0.5
+gamma: 0.2
+label_smoothing: 0.0

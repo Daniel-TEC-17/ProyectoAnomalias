@@ -5,9 +5,9 @@ defaults:
 
 name: "resnet_scratch"
 type: "scratch"
-  
+
 # Arquitectura
-latent_dim: 128  # Dimensión del espacio latente (embedding)
+latent_dim: 128  # Dimension del espacio latente (embedding)
 dropout: 0.3
 use_batch_norm: true
 learning_rate: 0.001  

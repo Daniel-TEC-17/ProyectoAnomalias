@@ -9,5 +9,5 @@ amsgrad: false
 scheduler:
   name: "cosine"
   enabled: true
-  T_max: 100  # max_epochs (se sobrescribe dinámicamente)
+  T_max: 100  # max_epochs (se sobrescribe dinamicamente)
   eta_min: 1.0e-6 

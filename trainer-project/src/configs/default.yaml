@@ -1,0 +1,21 @@
+hyperparameters:
+  learning_rate: 0.001
+  batch_size: 32
+  num_epochs: 50
+
+data:
+  train_data_path: "data/train.csv"
+  val_data_path: "data/val.csv"
+  test_data_path: "data/test.csv"
+
+model:
+  architecture: "MyModel"
+  input_size: 784
+  output_size: 10
+
+training:
+  save_model_path: "models/saved_model.pth"
+  log_interval: 10
+
+device:
+  use_cuda: true

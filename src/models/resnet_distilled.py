@@ -35,6 +35,16 @@ class ResNetDistilledModule(pl.LightningModule):
         # Configurar student (misma arquitectura que scratch)
         self.student = self._build_student(num_classes, latent_dim, dropout)
         
+        # Proyección para alinear dimensiones de embeddings teacher -> student (si hace falta)
+        # El embedding del teacher (features antes del fc) en ResNet18 tiene tamaño teacher.fc.in_features
+        teacher_feat_dim = getattr(self.teacher.fc, "in_features", None)
+        if teacher_feat_dim is None:
+            # fallback: hacer un forward dummy sería más robusto, pero asumimos ResNet estándar
+            teacher_feat_dim = 512
+        self.teacher_proj = None
+        if teacher_feat_dim != latent_dim:
+            self.teacher_proj = nn.Linear(teacher_feat_dim, latent_dim, bias=False)
+        
         # Configurar loss
         self._setup_loss(loss_config)
         
@@ -117,7 +127,7 @@ class ResNetDistilledModule(pl.LightningModule):
         return self.student(x)
     
     def get_embeddings(self, x):
-        """Extraer embeddings del student."""
+        """Extraer embeddings del student (B, latent_dim)."""
         x = self.student.conv1(x)
         x = self.student.bn1(x)
         x = self.student.relu(x)
@@ -132,12 +142,12 @@ class ResNetDistilledModule(pl.LightningModule):
         x = torch.flatten(x, 1)
         
         x = self.student.fc[0](x)  # Dropout
-        embeddings = self.student.fc[1](x)  # Linear -> embedding
+        embeddings = self.student.fc[1](x)  # Linear -> embedding (B, latent_dim)
         
         return embeddings
     
     def _get_teacher_embeddings(self, x):
-        """Extraer embeddings del teacher."""
+        """Extraer embeddings del teacher (B, teacher_feat_dim)."""
         x = self.teacher.conv1(x)
         x = self.teacher.bn1(x)
         x = self.teacher.relu(x)
@@ -151,16 +161,13 @@ class ResNetDistilledModule(pl.LightningModule):
         x = self.teacher.avgpool(x)
         x = torch.flatten(x, 1)
         
-        return x  # Embedding antes de FC
+        return x  # Embedding antes de FC (B, teacher_feat_dim)
     
     def compute_distillation_loss(self, student_logits, teacher_logits, 
                                    student_embeddings, teacher_embeddings, labels):
         """
         Calcular loss de distillation combinado.
-        
-        Returns:
-            total_loss: pérdida total
-            losses_dict: diccionario con componentes individuales
+        Reemplaza la implementación anterior por una que alinea dimensiones dinámicamente.
         """
         # 1. Hard Loss (con ground truth labels)
         loss_hard = self.hard_loss(student_logits, labels)
@@ -171,18 +178,69 @@ class ResNetDistilledModule(pl.LightningModule):
         loss_soft = self.soft_loss(student_soft, teacher_soft) * (self.temperature ** 2)
         
         # 3. Feature Loss (MSE entre embeddings)
-        loss_feature = self.feature_loss(student_embeddings, teacher_embeddings)
+        s = student_embeddings  # e.g. (B, latent_dim) o (B,C,H,W)
+        t = teacher_embeddings  # e.g. (B, teacher_feat_dim) o (B,C,H,W)
+        
+        # Si shapes ya coinciden, OK
+        if s.shape != t.shape:
+            # Caso embeddings 2D (B, C) -> usar Linear projection teacher->student
+            if s.dim() == 2 and t.dim() == 2 and s.shape[1] != t.shape[1]:
+                # crear o re-configurar teacher_proj dinámicamente si hace falta
+                if (getattr(self, "teacher_proj", None) is None
+                        or getattr(self.teacher_proj, "in_features", None) != t.shape[1]
+                        or getattr(self.teacher_proj, "out_features", None) != s.shape[1]):
+                    # crear y registrar proyección linear
+                    self.teacher_proj = nn.Linear(t.shape[1], s.shape[1], bias=False).to(self.device)
+                # mover a device correcto y proyectar
+                if next(self.teacher_proj.parameters()).device != s.device:
+                    self.teacher_proj.to(s.device)
+                t = self.teacher_proj(t)
+            
+            # Caso embeddings espaciales (B, C, H, W) -> usar Conv2d 1x1
+            elif s.dim() == 4 and t.dim() == 4 and s.shape[1] != t.shape[1]:
+                # crear o re-configurar feature_proj (Conv1x1)
+                if (getattr(self, "feature_proj", None) is None
+                        or self.feature_proj.in_channels != t.shape[1]
+                        or self.feature_proj.out_channels != s.shape[1]):
+                    self.feature_proj = nn.Conv2d(t.shape[1], s.shape[1], kernel_size=1, bias=False).to(self.device)
+                if next(self.feature_proj.parameters()).device != s.device:
+                    self.feature_proj.to(s.device)
+                t = self.feature_proj(t)
+            
+            # Otros casos: intentar flattenar/average pool teacher si student es vector y teacher tiene mapa
+            elif s.dim() == 2 and t.dim() == 4:
+                # global average pool teacher -> (B, C)
+                t_pooled = torch.flatten(torch.mean(t, dim=[2,3]), 1)
+                if t_pooled.shape[1] != s.shape[1]:
+                    # crear proy linear si hace falta
+                    if (getattr(self, "teacher_proj", None) is None
+                            or getattr(self.teacher_proj, "in_features", None) != t_pooled.shape[1]
+                            or getattr(self.teacher_proj, "out_features", None) != s.shape[1]):
+                        self.teacher_proj = nn.Linear(t_pooled.shape[1], s.shape[1], bias=False).to(self.device)
+                    if next(self.teacher_proj.parameters()).device != s.device:
+                        self.teacher_proj.to(s.device)
+                    t = self.teacher_proj(t_pooled)
+                else:
+                    t = t_pooled.to(s.device)
+            
+            else:
+                # Si no se puede alinear explícitamente, lanzar error informativo
+                raise RuntimeError(f"Cannot align student embeddings shape {s.shape} with teacher embeddings shape {t.shape}")
+        
+        # En este punto s and t deben tener la misma shape
+        loss_feature = self.feature_loss(s, t)
         
         # Loss total ponderado
         total_loss = (self.alpha * loss_hard + 
                      self.beta * loss_soft + 
                      self.gamma * loss_feature)
         
+        # Devolver también componentes para logging (floats)
         losses_dict = {
-            'hard': loss_hard.item(),
-            'soft': loss_soft.item(),
-            'feature': loss_feature.item(),
-            'total': total_loss.item()
+            'hard': loss_hard.item() if isinstance(loss_hard, torch.Tensor) else float(loss_hard),
+            'soft': loss_soft.item() if isinstance(loss_soft, torch.Tensor) else float(loss_soft),
+            'feature': loss_feature.item() if isinstance(loss_feature, torch.Tensor) else float(loss_feature),
+            'total': total_loss.item() if isinstance(total_loss, torch.Tensor) else float(total_loss)
         }
         
         return total_loss, losses_dict
@@ -273,10 +331,14 @@ class ResNetDistilledModule(pl.LightningModule):
         """Configurar optimizer y scheduler (solo para student)."""
         cfg = self.optimizer_config
         
-        # Solo optimizar parámetros del student
+        # Solo optimizar parámetros del student (y de teacher_proj si existe)
+        params = list(self.student.parameters())
+        if self.teacher_proj is not None:
+            params += list(self.teacher_proj.parameters())
+        
         if cfg.name == 'adam':
             optimizer = torch.optim.Adam(
-                self.student.parameters(),
+                params,
                 lr=cfg.learning_rate,
                 weight_decay=cfg.weight_decay,
                 betas=cfg.get('betas', [0.9, 0.999]),
@@ -286,7 +348,7 @@ class ResNetDistilledModule(pl.LightningModule):
         
         elif cfg.name == 'adamw':
             optimizer = torch.optim.AdamW(
-                self.student.parameters(),
+                params,
                 lr=cfg.learning_rate,
                 weight_decay=cfg.weight_decay,
                 betas=cfg.get('betas', [0.9, 0.999]),
@@ -296,7 +358,7 @@ class ResNetDistilledModule(pl.LightningModule):
         
         elif cfg.name == 'sgd':
             optimizer = torch.optim.SGD(
-                self.student.parameters(),
+                params,
                 lr=cfg.learning_rate,
                 momentum=cfg.get('momentum', 0.9),
                 weight_decay=cfg.weight_decay,

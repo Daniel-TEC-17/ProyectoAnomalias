@@ -2,6 +2,9 @@ defaults:
   - /loss: distillation
   - /optimizer: adam
 
+name: "resnet_distilled"
+type: "distilled"
+
 
 latent_dim: 128
 dropout: 0.3

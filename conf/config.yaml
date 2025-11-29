@@ -9,12 +9,12 @@ defaults:
 # Semilla para reproducibilidad
 seed: 42
 
-# Rutas y configuración de datos
+# Rutas y configuracion de datos
 data:
   data_dir: "./Images/DATASET_128x128"
   image_size: 128
   batch_size: 32
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   validation_split: 0.2  # Ya aplicado en preprocesamiento
 
@@ -39,7 +39,7 @@ callbacks:
     mode: "min"
     patience: 15
     min_delta: 0.001
-  
+
   checkpoint:
     monitor: "val/loss"
     mode: "min"
@@ -51,4 +51,4 @@ callbacks:
 experiment:
   name: "resnet_mvtec"
   description: "ResNet models for MVTec anomaly detection"
-  run_name: null  # Se genera automáticamente si es null
+  run_name: null  # Se genera automaticamente si es null

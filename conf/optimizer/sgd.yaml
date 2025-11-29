@@ -1,7 +1,7 @@
 
 
 name: "sgd"
-learning_rate: 0.01  # SGD necesita LR más alto
+learning_rate: 0.01  # SGD necesita LR mas alto
 momentum: 0.9
 weight_decay: 0.0001
 nesterov: true
@@ -9,8 +9,8 @@ nesterov: true
 scheduler:
   name: "step"
   enabled: true
-  
-  # Parámetros para StepLR
+
+  # Parametros para StepLR
   step_size: 30
   gamma: 0.1
   

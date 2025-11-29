@@ -5,12 +5,12 @@ project: "mvtec-anomaly-detection"
 entity: null  # Tu username de WandB (o null para default)
 save_dir: "./logs"
 
-# Qué loggear
+# Que loggear
 log_model: true  # Guardar mejores modelos en WandB
 log_gradients: false  # true solo para debugging
 log_graph: false  # true para ver arquitectura
 
-# Configuración
+# Configuracion
 offline: false  # true para modo offline
 tags: []  # Agregar tags para organizar experimentos
-notes: null  # Descripción del experimento
+notes: null  # Descripcion del experimento

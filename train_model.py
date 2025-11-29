@@ -44,17 +44,17 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
         from models.resnet_distilled import ResNetDistilledModule
         
         model = ResNetDistilledModule(
-            num_classes=cfg.num_classes,
-            latent_dim=cfg.model.latent_dim,
-            dropout=cfg.model.dropout,
-            learning_rate=cfg.optimizer.learning_rate,
-            weight_decay=cfg.optimizer.weight_decay,
+            num_classes=cfg.get('num_classes', getattr(cfg, 'num_classes', 10)),
+            latent_dim=cfg.model.get('latent_dim', 128),
+            dropout=cfg.model.get('dropout', 0.3),
+            learning_rate=cfg.model.get('learning_rate', 1e-3),
+            weight_decay=cfg.model.get('weight_decay', 1e-4),
             optimizer_config=cfg.optimizer,
             loss_config=cfg.loss,
-            teacher_model=cfg.model.teacher_model,
-            teacher_weights=cfg.model.teacher_weights,
-            freeze_teacher=cfg.model.freeze_teacher,
-            max_epochs=cfg.model.max_epochs
+            teacher_model=cfg.model.get('teacher_model', 'resnet18'),
+            teacher_weights=cfg.model.get('teacher_weights', 'IMAGENET1K_V1'),
+            freeze_teacher=cfg.model.get('freeze_teacher', True),
+            max_epochs=cfg.get('max_epochs', 100)
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}. Use 'scratch' or 'distilled'")
