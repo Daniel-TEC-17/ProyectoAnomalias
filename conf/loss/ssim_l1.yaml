@@ -1,0 +1,7 @@
+# conf/loss/ssim_l1.yaml
+name: ssim_l1_loss
+type: SSIM_L1
+window_size: 11
+sigma: 1.5
+data_range: 1.0
+l1_weight: 0.1  # Peso de la parte L1 en la suma

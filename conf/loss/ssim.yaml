@@ -1,0 +1,6 @@
+# conf/loss/ssim.yaml
+name: ssim_loss
+type: SSIM
+window_size: 11
+sigma: 1.5
+data_range: 1.0

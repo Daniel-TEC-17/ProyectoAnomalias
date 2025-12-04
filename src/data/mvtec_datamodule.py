@@ -1,8 +1,7 @@
 """
 MVTec AD DataModule para PyTorch Lightning
-Carga solo imágenes 'good' para train y validation
+Compatible con la estructura física: train/validation/test
 """
-import os
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -28,18 +27,15 @@ class MVTecDataset(Dataset):
             data_dir: directorio base (ej: DATASET_128x128)
             split: 'train', 'validation', o 'test'
             transform: transformaciones de torchvision
-            class_names: lista de nombres de clases
+            class_names: lista de nombres de clases (para mapear a labels)
         """
-        
         self.data_dir = Path(data_dir)
         self.split = split
         self.transform = transform
         self.class_names = class_names or []
-        
-        # Cargar imágenes
-        self.images = []
+        self.image_paths = [] 
         self.labels = []
-        self.is_anomaly = []  # Para test set
+        self.is_anomaly = []
         
         self._load_images()
         
@@ -48,61 +44,71 @@ class MVTecDataset(Dataset):
         split_dir = self.data_dir / self.split
         
         if not split_dir.exists():
-            raise ValueError(f"Split directory not found: {split_dir}")
+            # Fallback por si acaso, pero tu script ya creó las carpetas
+            print(f"⚠️ Alerta: No existe {split_dir}, buscando en raíz...")
+            split_dir = self.data_dir
         
-        # Obtener todas las imágenes del split
-        for img_path in sorted(split_dir.glob("*.*")):
-            if img_path.suffix.lower() not in ['.png', '.jpg', '.jpeg']:
-                continue
-            
-            # Extraer información del nombre: dataset_split_class_id.ext
-            # Ejemplo: cable_train_good_000.png
+        # Buscar imágenes
+        valid_exts = {'.png', '.jpg', '.jpeg'}
+        # Glob recursivo por si hay subcarpetas, aunque tu script lo deja plano
+        files = sorted([p for p in split_dir.glob("**/*") if p.suffix.lower() in valid_exts])
+
+        if len(files) == 0:
+            print(f"⚠️ No se encontraron imágenes en {split_dir}")
+            return
+
+        for img_path in files:
+            # Parsear nombre: dataset_split_class_id.ext
+            # Ej: cable_train_good_000.png
             parts = img_path.stem.split('_')
             
+            # Lógica robusta de parsing
+            dataset_name = "unknown"
+            class_type = "good"
+            
             if len(parts) >= 3:
-                dataset_name = parts[0]  # cable
-                split_name = parts[1]    # train
-                class_name = parts[2]    # good
-                
-                # Asignar label basado en el dataset
-                if dataset_name in self.class_names:
-                    label = self.class_names.index(dataset_name)
-                else:
-                    label = 0  # Default
-                
-                # Determinar si es anomalía (solo relevante para test)
-                is_anomaly = (class_name != 'good')
-                
-                self.images.append(str(img_path))
-                self.labels.append(label)
-                self.is_anomaly.append(is_anomaly)
+                dataset_name = parts[0]  # 'cable'
+                # parts[1] es el split ('train'/'test'/'val')
+                # parts[2] suele ser la clase ('good', 'crack', etc.)
+                class_type = parts[2]
+            
+            # 1. Asignar Label Numérico (0-9) para clasificación
+            if dataset_name in self.class_names:
+                label = self.class_names.index(dataset_name)
+            else:
+                label = 0
+            
+            # 2. Flag de Anomalía (0=Normal, 1=Anomalía)
+            is_anom = 0 if class_type == "good" else 1
+            
+            self.image_paths.append(str(img_path))
+            self.labels.append(label)
+            self.is_anomaly.append(is_anom)
     
     def __len__(self) -> int:
-        return len(self.images)
+        return len(self.image_paths)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         """
-        Returns:
-            image: tensor de la imagen
-            label: clase del dataset (0-9)
-
-        Note: `is_anomaly` is stored internally but is not returned
-        to keep batches compatible with models that expect `(image, label)`.
-        If you need the anomaly flag for specific evaluation code, use
-        the dataset's `is_anomaly` attribute or access the image path.
+        Retorna:
+            image: Tensor [C, H, W]
+            label: Int (índice de la clase del objeto, ej: 0 para cable)
         """
-        # Cargar imagen
-        img_path = self.images[idx]
-        image = Image.open(img_path).convert('RGB')
+        img_path = self.image_paths[idx]
         
-        # Aplicar transformaciones
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"Error cargando {img_path}: {e}")
+            image = Image.new('RGB', (128, 128)) # Fallback negro
+        
         if self.transform:
             image = self.transform(image)
         
         label = self.labels[idx]
-        # Keep anomaly flag internally (for external evaluation), but
-        # return only (image, label) so training/validation/test loops
-        # that expect two-item batches work without unpack errors.
+        
+        # Retornamos (img, label) para compatibilidad con Lightning
+        # Si es un Autoencoder, el training_step ignorará el label.
         return image, label
 
 
@@ -116,53 +122,45 @@ class MVTecDataModule(pl.LightningDataModule):
         batch_size: int = 32,
         num_workers: int = 4,
         pin_memory: bool = True,
-        image_size: Tuple[int, int] = (128, 128)
+        image_size: int = 128, # Cambiado a int para simplificar config
+        **kwargs 
     ):
-        """
-        Args:
-            data_dir: directorio base con train/validation/test
-            class_names: lista de nombres de las 10 clases
-            batch_size: tamaño del batch
-            num_workers: workers para DataLoader
-            pin_memory: usar pin_memory para GPU
-            image_size: tamaño de las imágenes (ya deberían estar resized)
-        """
         super().__init__()
         self.data_dir = data_dir
         self.class_names = class_names
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.image_size = image_size
+        # Asegurar tupla
+        self.image_size = (image_size, image_size) if isinstance(image_size, int) else image_size
         
-        # Datasets
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
         
     def setup(self, stage: Optional[str] = None):
-        """Preparar datasets."""
-        
-        # Transformaciones para train (con augmentation)
+        """
+        Carga los datasets 'train', 'validation' y 'test' desde las carpetas
+        físicas creadas por el script de procesamiento.
+        """
+        # Transformaciones
+        # Train: Augmentation suave
         train_transform = transforms.Compose([
             transforms.Resize(self.image_size),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
+            # Normalización típica de ImageNet
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) 
         ])
         
-        # Transformaciones para val/test (sin augmentation)
+        # Eval: Solo resize y tensor (sin augmentation)
         eval_transform = transforms.Compose([
             transforms.Resize(self.image_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
-        # Crear datasets
         if stage == "fit" or stage is None:
             self.train_dataset = MVTecDataset(
                 self.data_dir, 
@@ -170,6 +168,7 @@ class MVTecDataModule(pl.LightningDataModule):
                 transform=train_transform,
                 class_names=self.class_names
             )
+            # CARGA EXPLÍCITA DE LA CARPETA VALIDATION
             self.val_dataset = MVTecDataset(
                 self.data_dir, 
                 split="validation", 
@@ -186,28 +185,26 @@ class MVTecDataModule(pl.LightningDataModule):
             )
     
     def train_dataloader(self) -> DataLoader:
-        """DataLoader para entrenamiento."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            drop_last=True  # Evita batches incompletos
+            persistent_workers=True if self.num_workers > 0 else False
         )
     
     def val_dataloader(self) -> DataLoader:
-        """DataLoader para validación."""
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=False, # Importante: No mezclar para ver imágenes estables en WandB
             num_workers=self.num_workers,
-            pin_memory=self.pin_memory
+            pin_memory=self.pin_memory,
+            persistent_workers=True if self.num_workers > 0 else False
         )
     
     def test_dataloader(self) -> DataLoader:
-        """DataLoader para test."""
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
@@ -217,7 +214,6 @@ class MVTecDataModule(pl.LightningDataModule):
         )
     
     def get_num_samples(self) -> dict:
-        """Obtener número de muestras por split."""
         return {
             'train': len(self.train_dataset) if self.train_dataset else 0,
             'val': len(self.val_dataset) if self.val_dataset else 0,

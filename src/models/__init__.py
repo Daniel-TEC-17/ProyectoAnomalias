@@ -13,6 +13,9 @@ from .resnet_scratch import (
 from .resnet_distilled import (
     ResNetDistilledModule,
 )
+from .autoencoder_unet import (
+    UNetAutoencoderModule
+)
 
 __all__ = [
     # Lightning Modules

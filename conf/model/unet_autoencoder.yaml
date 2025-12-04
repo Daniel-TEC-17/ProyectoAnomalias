@@ -1,0 +1,15 @@
+# conf/model/unet_autoencoder.yaml
+name: unet_autoencoder
+type: autoencoder  # Importante: esto activa el "elif" en train_model.py
+
+# Parámetros de arquitectura (coinciden con __init__ de UNetAutoencoderModule)
+in_channels: 3
+base_channels: 32
+depth: 4
+latent_dim: 128    # Tamaño del cuello de botella (bottleneck)
+
+# Parámetros de entrenamiento
+dropout: 0.0       # U-Net estandar no suele llevar mucho dropout, pero puedes subirlo
+learning_rate: 0.001
+weight_decay: 1e-5
+max_epochs: 100

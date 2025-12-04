@@ -1,0 +1,3 @@
+# conf/loss/l1.yaml
+name: l1_loss
+type: L1Loss

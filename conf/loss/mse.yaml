@@ -1,0 +1,3 @@
+# conf/loss/mse.yaml
+name: mse_loss
+type: MSELoss

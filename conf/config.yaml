@@ -6,7 +6,6 @@ defaults:
   - optimizer: adam
   - _self_
 
-# Semilla para reproducibilidad
 seed: 42
 
 # Rutas y configuracion de datos
@@ -16,7 +15,6 @@ data:
   batch_size: 32
   num_workers: 0
   pin_memory: true
-  validation_split: 0.2  # Ya aplicado en preprocesamiento
 
 # Clases del dataset (10 clases seleccionadas)
 num_classes: 10
@@ -37,8 +35,8 @@ callbacks:
   early_stopping:
     monitor: "val/loss"
     mode: "min"
-    patience: 15
-    min_delta: 0.001
+    patience: 3      
+    min_delta: 0.0      
 
   checkpoint:
     monitor: "val/loss"
@@ -49,6 +47,6 @@ callbacks:
 
 # Experimento
 experiment:
-  name: "resnet_mvtec"
-  description: "ResNet models for MVTec anomaly detection"
-  run_name: null  # Se genera automaticamente si es null
+  name: "mvtec_experiment"
+  description: "Models for MVTec anomaly detection"
+  run_name: null 

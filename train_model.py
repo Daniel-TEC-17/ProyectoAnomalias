@@ -1,48 +1,341 @@
+import os
+
+# --- CORRECCIÓN CRÍTICA PARA CRASH EN WINDOWS ---
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+# ------------------------------------------------
+
+import torch
+import numpy as np
+# ... resto de imports ...
+
+import torch
+import numpy as np
+import wandb
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.manifold import TSNE
+import seaborn as sns
+import pandas as pd
+
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
-import wandb
-from pathlib import Path
 
+# ==============================================================================
+# CALLBACK 1: RECONSTRUCCIÓN DE IMÁGENES (Ya lo tenías)
+# ==============================================================================
+class ImageReconstructionLogger(pl.Callback):
+    """
+    Loguea reconstrucciones de imágenes fijas (una por cada clase de MVTec) en WandB.
+    Mantiene las mismas imágenes a lo largo de las épocas para ver la evolución.
+    """
+    def __init__(self, num_samples=10):
+        super().__init__()
+        self.num_samples = num_samples
+        self.val_images = None  # Cache para las imágenes fijas
+        # Las 10 clases de MVTec
+        self.target_classes = [
+            "cable", "capsule", "grid", "hazelnut", "leather", 
+            "metal_nut", "pill", "screw", "tile", "transistor"
+        ]
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Solo ejecutar si es un autoencoder (tiene decoder)
+        if not (hasattr(pl_module, 'decoder') or hasattr(pl_module, 'dec_blocks')):
+            return
+
+        # 1. Seleccionar imágenes fijas la primera vez (para que sean siempre las mismas)
+        if self.val_images is None:
+            self.val_images = self._select_diverse_images(trainer, pl_module)
+        
+        if self.val_images is None:
+            return 
+
+        # 2. Reconstruir
+        # Mover a dispositivo
+        images = self.val_images.to(pl_module.device)
+        
+        with torch.no_grad():
+            pl_module.eval()
+            reconstructions = pl_module(images)
+            pl_module.train()
+
+        # 3. Loguear
+        self._log_images(trainer, images, reconstructions)
+
+    def _select_diverse_images(self, trainer, pl_module):
+        """Intenta seleccionar una imagen por cada clase del dataset de validación."""
+        try:
+            val_loader = trainer.datamodule.val_dataloader()
+            dataset = val_loader.dataset
+            
+            # Manejar Subsets (común cuando se usa random_split)
+            indices = list(range(len(dataset)))
+            source_dataset = dataset
+            if hasattr(dataset, 'indices'):
+                indices = dataset.indices
+                source_dataset = dataset.dataset
+            
+            # Buscar una imagen por clase
+            selected_indices = []
+            found_classes = set()
+            
+            # Verificar si podemos acceder a los paths (común en MVTecDataset custom)
+            if hasattr(source_dataset, 'image_paths'):
+                paths = source_dataset.image_paths
+                for idx in indices:
+                    # Obtener path
+                    path = str(paths[idx]).lower()
+                    # Verificar a qué clase pertenece
+                    for cls in self.target_classes:
+                        if cls in path and cls not in found_classes:
+                            selected_indices.append(idx)
+                            found_classes.add(cls)
+                            break
+                    # Si ya tenemos las 10, paramos
+                    if len(found_classes) >= len(self.target_classes):
+                        break
+            
+            # Si no encontramos suficientes (o el dataset no tiene image_paths accesible)
+            # Rellenamos con las primeras disponibles para llegar a num_samples
+            if len(selected_indices) < self.num_samples:
+                print(f"⚠️ ImageReconstructionLogger: Solo se encontraron clases: {list(found_classes)}")
+                for idx in indices:
+                    if idx not in selected_indices:
+                        selected_indices.append(idx)
+                    if len(selected_indices) >= self.num_samples:
+                        break
+            
+            # Cargar los tensores de las imágenes seleccionadas
+            batch_images = []
+            for idx in selected_indices:
+                item = source_dataset[idx]
+                # El dataset puede devolver (img, label) o solo img
+                img = item[0] if isinstance(item, (tuple, list)) else item
+                batch_images.append(img)
+            
+            # Convertir a un solo tensor batch
+            return torch.stack(batch_images)
+
+        except Exception as e:
+            print(f"⚠️ Error seleccionando imágenes diversas: {e}. Usando batch aleatorio.")
+            # Fallback: tomar el primer batch del loader
+            batch = next(iter(val_loader))
+            images = batch[0] if isinstance(batch, (list, tuple)) else batch
+            return images[:self.num_samples]
+
+    def _log_images(self, trainer, images, reconstructions):
+        images = images.cpu().numpy()
+        reconstructions = reconstructions.cpu().numpy()
+        
+        log_images = []
+        for i, (orig, recon) in enumerate(zip(images, reconstructions)):
+            # Formato (C, H, W) -> (H, W, C) para visualización
+            orig = np.transpose(orig, (1, 2, 0))
+            recon = np.transpose(recon, (1, 2, 0))
+            
+            # Concatenar lado a lado
+            combined = np.concatenate((orig, recon), axis=1)
+            combined = np.clip(combined, 0, 1)
+            
+            # Título dinámico
+            caption = f"Muestra {i+1}"
+            if i < len(self.target_classes):
+                # Si logramos ordenarlos, intentamos adivinar el nombre (solo visual)
+                # Nota: esto asume que _select_diverse_images encontró en orden, si no, es solo indicativo
+                pass 
+
+            log_images.append(wandb.Image(combined, caption=caption))
+
+        trainer.logger.experiment.log({"val/reconstructions": log_images})
+
+# ==============================================================================
+# CALLBACK 2: ANÁLISIS DE OVERFITTING (Train vs Val Loss) - CORRECCIÓN 2
+# ==============================================================================
+class OverfittingCurveCallback(pl.Callback):
+    """
+    Genera una gráfica comparativa de Train vs Val loss al final del entrenamiento.
+    Ayuda a detectar Overfitting visualmente.
+    """
+    def __init__(self):
+        super().__init__()
+        self.train_loss_history = []
+        self.val_loss_history = []
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        # Intentar obtener métricas logueadas. 
+        # Nota: 'train/loss' debe ser logueado con on_epoch=True en el modelo
+        metrics = trainer.callback_metrics
+        if 'train/loss' in metrics:
+            self.train_loss_history.append(metrics['train/loss'].item())
+        elif 'train_loss' in metrics:
+            self.train_loss_history.append(metrics['train_loss'].item())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        if 'val/loss' in metrics:
+            self.val_loss_history.append(metrics['val/loss'].item())
+        elif 'val_loss' in metrics:
+            self.val_loss_history.append(metrics['val_loss'].item())
+
+    def on_fit_end(self, trainer, pl_module):
+        # Verificar que tengamos datos
+        if len(self.train_loss_history) == 0 or len(self.val_loss_history) == 0:
+            return
+
+        # Ajustar longitudes (a veces val corre una vez más o menos que train)
+        min_len = min(len(self.train_loss_history), len(self.val_loss_history))
+        epochs = range(1, min_len + 1)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(epochs, self.train_loss_history[:min_len], 'b-', label='Training Loss')
+        ax.plot(epochs, self.val_loss_history[:min_len], 'r-', label='Validation Loss')
+        
+        ax.set_title(f'Overfitting Analysis: Train vs Val Loss')
+        ax.set_xlabel('Epochs')
+        ax.set_ylabel('Loss')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Loguear a WandB
+        trainer.logger.experiment.log({"analysis/overfitting_curve": wandb.Image(fig)})
+        plt.close(fig)
+"""
+# ==============================================================================
+# CALLBACK 3: t-SNE SPACE VISUALIZER 
+# ==============================================================================
+
+class TSNEVisualizerCallback(pl.Callback):
+    def __init__(self, max_samples=1000):
+        super().__init__()
+        self.max_samples = max_samples
+
+    def on_test_end(self, trainer, pl_module):
+        if not hasattr(pl_module, 'get_embeddings'):
+            return
+
+        print("\n🎨 Generando visualización del espacio latente...")
+        
+        # 1. Configurar Matplotlib para no usar ventana gráfica (evita crashes)
+        import matplotlib
+        matplotlib.use('Agg') 
+        import matplotlib.pyplot as plt
+        
+        # 2. Recolectar datos
+        test_loader = trainer.datamodule.test_dataloader()
+        embeddings_list = []
+        labels_list = []
+        
+        pl_module.eval()
+        with torch.no_grad():
+            for batch in test_loader:
+                # Manejo robusto de tuplas
+                if isinstance(batch, (list, tuple)):
+                    imgs = batch[0]
+                    lbls = batch[1]
+                else:
+                    continue # No hay etiquetas
+                
+                imgs = imgs.to(pl_module.device)
+                emb = pl_module.get_embeddings(imgs)
+                
+                if len(emb.shape) > 2:
+                    emb = torch.flatten(emb, 1)
+                
+                # Pasar a CPU inmediatamente y limpiar
+                embeddings_list.append(emb.cpu().detach().numpy())
+                labels_list.append(lbls.cpu().detach().numpy())
+                
+                if sum([len(x) for x in embeddings_list]) >= self.max_samples:
+                    break
+        
+        if not embeddings_list:
+            print("⚠️ No se extrajeron embeddings.")
+            return
+
+        # Concatenar
+        X = np.concatenate(embeddings_list, axis=0)[:self.max_samples]
+        y = np.concatenate(labels_list, axis=0)[:self.max_samples]
+        
+        # 3. Intentar reducción de dimensionalidad
+        df_plot = None
+        method_name = ""
+        
+        try:
+            # INTENTO 1: t-SNE (Propenso a fallar en Windows/PyTorch mix)
+            from sklearn.manifold import TSNE
+            print("   -> Ejecutando t-SNE (n_jobs=1)...")
+            
+            perp = min(30, len(X) - 1)
+            # method='exact' es más lento pero usa menos optimizaciones agresivas que 'barnes-hut'
+            tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init='pca', 
+                        learning_rate='auto', n_jobs=1, method='barnes_hut')
+            
+            X_2d = tsne.fit_transform(X)
+            method_name = "t-SNE"
+            
+        except Exception as e:
+            print(f"⚠️ t-SNE falló ({e}). Cambiando a PCA...")
+            # INTENTO 2: PCA (Muy estable)
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2)
+            X_2d = pca.fit_transform(X)
+            method_name = "PCA"
+
+        # 4. Graficar
+        if X_2d is not None:
+            try:
+                # Crear DataFrame localmente para no depender de pandas externo
+                df_data = {'Dim 1': X_2d[:, 0], 'Dim 2': X_2d[:, 1]}
+                labels_str = ['Anomaly' if lbl == 1 else 'Good' for lbl in y]
+                
+                plt.figure(figsize=(10, 8))
+                sns.scatterplot(x=df_data['Dim 1'], y=df_data['Dim 2'], 
+                                hue=labels_str, style=labels_str,
+                                palette={'Good': 'blue', 'Anomaly': 'red'},
+                                alpha=0.7)
+                
+                plt.title(f'{method_name} Latent Space Visualization')
+                plt.tight_layout()
+                
+                trainer.logger.experiment.log({"analysis/latent_space": wandb.Image(plt)})
+                plt.close()
+                print(f"✅ Visualización ({method_name}) guardada en WandB.")
+            except Exception as e:
+                print(f"❌ Error al graficar: {e}")
+                
+"""
+
+# ==============================================================================
+# FUNCIÓN DE ENTRENAMIENTO PRINCIPAL
+# ==============================================================================
 
 def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
     """
     Entrenar modelo con configuración de Hydra.
-    
-    Args:
-        cfg: Configuración completa de Hydra
-        datamodule: DataModule de PyTorch Lightning
-        model_type: Tipo de modelo ('scratch' o 'distilled')
-    
-    Returns:
-        trainer: Entrenador de PyTorch Lightning
-        model: Modelo entrenado
     """
     
-    # ==================================================================
-    # 1. CREAR MODELO SEGÚN TIPO
-    # ==================================================================
-    
+    # 1. CREAR MODELO
     if model_type == "scratch":
-        from models.resnet_scratch import ResNetScratchModule
-        
+        from src.models.resnet_scratch import ResNetScratchModule
         model = ResNetScratchModule(
             num_classes=cfg.num_classes,
             latent_dim=cfg.model.latent_dim,
             dropout=cfg.model.dropout,
-            learning_rate=cfg.optimizer.learning_rate,  # Desde optimizer
+            learning_rate=cfg.optimizer.learning_rate,
             weight_decay=cfg.optimizer.weight_decay,
-            # Pasar toda la config de optimizer
             optimizer_config=cfg.optimizer,
-            # Pasar config de loss
             loss_config=cfg.loss,
             max_epochs=cfg.model.max_epochs
         )
         
     elif model_type == "distilled":
-        from models.resnet_distilled import ResNetDistilledModule
-        
+        from src.models.resnet_distilled import ResNetDistilledModule
         model = ResNetDistilledModule(
             num_classes=cfg.get('num_classes', getattr(cfg, 'num_classes', 10)),
             latent_dim=cfg.model.get('latent_dim', 128),
@@ -56,38 +349,31 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
             freeze_teacher=cfg.model.get('freeze_teacher', True),
             max_epochs=cfg.get('max_epochs', 100)
         )
+
+    elif model_type == "autoencoder":
+        from src.models.autoencoder_unet import UNetAutoencoderModule
+        model = UNetAutoencoderModule(
+            in_channels=cfg.model.get('in_channels', 3),
+            base_channels=cfg.model.get('base_channels', 32),
+            depth=cfg.model.get('depth', 4),
+            latent_dim=cfg.model.get('latent_dim', 128),
+            optimizer_config=cfg.optimizer,
+            loss_config=cfg.loss,
+            max_epochs=cfg.model.max_epochs
+        )
+        
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Use 'scratch' or 'distilled'")
+        raise ValueError(f"Unknown model_type: {model_type}")
     
     
-    # ==================================================================
-    # 2. GENERAR NOMBRE DEL RUN
-    # ==================================================================
-    
+    # 2. CONFIGURAR LOGGER
     if cfg.experiment.run_name:
         run_name = cfg.experiment.run_name
     else:
-        # Generar automáticamente
         model_name = cfg.model.get('name', model_type)
-        run_name = (f"{model_name}_"
-                   f"z{cfg.model.latent_dim}_"
-                   f"lr{cfg.optimizer.learning_rate}_"
-                   f"bs{cfg.data.batch_size}")
+        run_name = f"{model_name}_z{cfg.model.latent_dim}"
     
     print(f"\n Run Name: {run_name}")
-    
-    
-    # ==================================================================
-    # 3. CONFIGURAR LOGGER (WandB)
-    # ==================================================================
-    
-    # Preparar tags
-    tags = cfg.logger.get('tags', []).copy() if cfg.logger.get('tags') else []
-    tags.extend([
-        model_type,
-        f"z{cfg.model.latent_dim}",
-        cfg.optimizer.name
-    ])
     
     wandb_logger = WandbLogger(
         project=cfg.logger.project,
@@ -95,52 +381,43 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
         save_dir=cfg.logger.save_dir,
         log_model=cfg.logger.log_model,
         offline=cfg.logger.get('offline', False),
-        tags=tags,
-        notes=cfg.logger.get('notes', None),
-        entity=cfg.logger.get('entity', None)
     )
-    
-    # Log de hiperparámetros completos
     wandb_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     
     
-    # ==================================================================
-    # 4. CONFIGURAR CALLBACKS
-    # ==================================================================
-    
+    # 3. CONFIGURAR CALLBACKS (ACTUALIZADO)
     checkpoint_dir = Path(f'./checkpoints/{run_name}')
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     callbacks = [
-        # Early Stopping
         EarlyStopping(
             monitor=cfg.callbacks.early_stopping.monitor,
             patience=cfg.callbacks.early_stopping.patience,
             mode=cfg.callbacks.early_stopping.mode,
-            min_delta=cfg.callbacks.early_stopping.min_delta,
             verbose=True
         ),
-        
-        # Model Checkpoint
         ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename=cfg.callbacks.checkpoint.filename,
             monitor=cfg.callbacks.checkpoint.monitor,
             mode=cfg.callbacks.checkpoint.mode,
             save_top_k=cfg.callbacks.checkpoint.save_top_k,
-            save_last=cfg.callbacks.checkpoint.save_last,
+            save_last=True,
             verbose=True
         ),
+        LearningRateMonitor(logging_interval='epoch'),
         
-        # Learning Rate Monitor
-        LearningRateMonitor(logging_interval='epoch')
+        # --- NUEVOS CALLBACKS SOLICITADOS ---
+        OverfittingCurveCallback(),  # Gráfica Train vs Val
+        # TSNEVisualizerCallback(max_samples=1000) # t-SNE coloreado por clase
     ]
+
+    # Callback específico solo para Autoencoder (Reconstrucción visual)
+    if model_type == "autoencoder":
+        callbacks.append(ImageReconstructionLogger(num_samples=4))
     
     
-    # ==================================================================
-    # 5. CONFIGURAR TRAINER
-    # ==================================================================
-    
+    # 4. TRAINER
     trainer = pl.Trainer(
         max_epochs=cfg.model.max_epochs,
         accelerator=cfg.trainer.accelerator,
@@ -149,136 +426,38 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
         logger=wandb_logger,
         callbacks=callbacks,
         log_every_n_steps=cfg.trainer.get('log_every_n_steps', 50),
-        check_val_every_n_epoch=cfg.trainer.get('check_val_every_n_epoch', 1),
-        deterministic=cfg.trainer.get('deterministic', True),
-        gradient_clip_val=cfg.trainer.get('gradient_clip_val', 1.0)
+        check_val_every_n_epoch=1,
+        deterministic=True
     )
     
-    
-    # ==================================================================
-    # 6. IMPRIMIR RESUMEN
-    # ==================================================================
-    
-    print("\n" + "="*80)
-    print(f" INICIANDO ENTRENAMIENTO: {run_name}")
-    print("="*80)
-    print(f" Modelo: {cfg.model.get('name', model_type)}")
-    print(f" Latent Dim: {cfg.model.latent_dim}")
-    print(f" Learning Rate: {cfg.optimizer.learning_rate}")
-    print(f"  Optimizer: {cfg.optimizer.name}")
-    
-    # Scheduler info
-    if cfg.optimizer.get('scheduler', {}).get('enabled', False):
-        print(f" Scheduler: {cfg.optimizer.scheduler.name}")
-    else:
-        print(f" Scheduler: None")
-    
-    print(f" Max Epochs: {cfg.model.max_epochs}")
-    print(f" Batch Size: {cfg.data.batch_size}")
-    
-    # Loss info
-    if model_type == "distilled":
-        print(f" Loss: {cfg.loss.name} (T={cfg.loss.temperature}, α={cfg.loss.alpha}, β={cfg.loss.beta})")
-    else:
-        print(f" Loss: {cfg.loss.name}")
-    
-    print(f" Checkpoint Dir: {checkpoint_dir}")
-    print("="*80 + "\n")
-    
-    
-    # ==================================================================
-    # 7. ENTRENAR
-    # ==================================================================
-    
+    # 5. ENTRENAMIENTO
+    print(f"\n=== INICIANDO ENTRENAMIENTO: {run_name} ===")
     trainer.fit(model, datamodule)
     
+    print("\n=== ENTRENAMIENTO COMPLETADO ===")
     
-    # ==================================================================
-    # 8. FINALIZAR Y REPORTAR
-    # ==================================================================
-    
-    print("\n" + "="*80)
-    print(" ENTRENAMIENTO COMPLETADO")
-    print("="*80)
-    print(f" Best checkpoint: {trainer.checkpoint_callback.best_model_path}")
-    print(f" Best val_loss: {trainer.checkpoint_callback.best_model_score:.4f}")
-    print("="*80 + "\n")
+    # 6. TEST (Importante para generar el t-SNE final)
+    print("\n=== EJECUTANDO TEST & T-SNE ===")
+    trainer.test(model, datamodule)
     
     wandb.finish()
     
     return trainer, model
 
 
+# UTILS DE CARGA (Sin cambios mayores, solo soporte de imports)
 def load_trained_model(checkpoint_path: str, model_type: str = "scratch"):
-    """
-    Cargar modelo desde checkpoint.
-    
-    Args:
-        checkpoint_path: Ruta al checkpoint (.ckpt)
-        model_type: Tipo de modelo ('scratch' o 'distilled')
-    
-    Returns:
-        model: Modelo cargado en modo eval
-    """
     if model_type == "scratch":
-        from models.resnet_scratch import ResNetScratchModule
-        model = ResNetScratchModule.load_from_checkpoint(checkpoint_path)
+        from src.models.resnet_scratch import ResNetScratchModule
+        model = ResNetScratchModule.load_from_checkpoint(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu', weights_only=False)
     elif model_type == "distilled":
-        from models.resnet_distilled import ResNetDistilledModule
-        model = ResNetDistilledModule.load_from_checkpoint(checkpoint_path)
+        from src.models.resnet_distilled import ResNetDistilledModule
+        model = ResNetDistilledModule.load_from_checkpoint(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu', weights_only=False)
+    elif model_type == "autoencoder":
+        from src.models.autoencoder_unet import UNetAutoencoderModule
+        model = UNetAutoencoderModule.load_from_checkpoint(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu', weights_only=False)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
     
     model.eval()
-    print(f" Modelo cargado desde: {checkpoint_path}")
     return model
-
-
-def get_best_checkpoint_path(run_name: str):
-    """
-    Obtener la ruta del mejor checkpoint de un run.
-    
-    Args:
-        run_name: Nombre del run
-    
-    Returns:
-        best_ckpt_path: Ruta al mejor checkpoint
-    """
-    checkpoint_dir = Path(f'./checkpoints/{run_name}')
-    
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"No se encontró directorio: {checkpoint_dir}")
-    
-    # Buscar archivo 'best-*.ckpt'
-    best_ckpts = list(checkpoint_dir.glob('best-*.ckpt'))
-    
-    if not best_ckpts:
-        raise FileNotFoundError(f"No se encontró 'best-*.ckpt' en {checkpoint_dir}")
-    
-    # Tomar el más reciente
-    best_ckpt_path = max(best_ckpts, key=lambda p: p.stat().st_mtime)
-    
-    return str(best_ckpt_path)
-
-
-def get_last_checkpoint_path(run_name: str):
-    """
-    Obtener la ruta del último checkpoint de un run.
-    
-    Args:
-        run_name: Nombre del run
-    
-    Returns:
-        last_ckpt_path: Ruta al último checkpoint
-    """
-    checkpoint_dir = Path(f'./checkpoints/{run_name}')
-    
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"No se encontró directorio: {checkpoint_dir}")
-    
-    last_ckpt = checkpoint_dir / 'last.ckpt'
-    
-    if not last_ckpt.exists():
-        raise FileNotFoundError(f"No se encontró 'last.ckpt' en {checkpoint_dir}")
-    
-    return str(last_ckpt)
