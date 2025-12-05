@@ -78,22 +78,16 @@ class ResNetDistilledModule(pl.LightningModule):
         return teacher
     
     def _build_student(self, num_classes, latent_dim, dropout):
-        """Construir modelo student."""
-        from torchvision.models import resnet18
+        """Construir modelo student usando la nueva arquitectura CustomResNet."""
+        from src.models.custom_resnet import CustomResNet
         
-        student = resnet18(weights=None)
-        
-        in_features = student.fc.in_features
-        student.fc = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(in_features, latent_dim),
-            nn.ReLU(),
-            nn.BatchNorm1d(latent_dim),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim, num_classes)
+        student = CustomResNet(
+            num_classes=num_classes,
+            latent_dim=latent_dim,
+            dropout=dropout
         )
         
-        self.embedding_layer = student.fc[1]
+        self.embedding_layer = student.embedding_layer
         
         return student
     
@@ -127,24 +121,8 @@ class ResNetDistilledModule(pl.LightningModule):
         return self.student(x)
     
     def get_embeddings(self, x):
-        """Extraer embeddings del student (B, latent_dim)."""
-        x = self.student.conv1(x)
-        x = self.student.bn1(x)
-        x = self.student.relu(x)
-        x = self.student.maxpool(x)
-        
-        x = self.student.layer1(x)
-        x = self.student.layer2(x)
-        x = self.student.layer3(x)
-        x = self.student.layer4(x)
-        
-        x = self.student.avgpool(x)
-        x = torch.flatten(x, 1)
-        
-        x = self.student.fc[0](x)  # Dropout
-        embeddings = self.student.fc[1](x)  # Linear -> embedding (B, latent_dim)
-        
-        return embeddings
+        """Extraer embeddings del student llamando al método del modelo."""
+        return self.student.get_embeddings(x)
     
     def _get_teacher_embeddings(self, x):
         """Extraer embeddings del teacher (B, teacher_feat_dim)."""
@@ -167,7 +145,6 @@ class ResNetDistilledModule(pl.LightningModule):
                                    student_embeddings, teacher_embeddings, labels):
         """
         Calcular loss de distillation combinado.
-        Reemplaza la implementación anterior por una que alinea dimensiones dinámicamente.
         """
         # 1. Hard Loss (con ground truth labels)
         loss_hard = self.hard_loss(student_logits, labels)
@@ -175,72 +152,26 @@ class ResNetDistilledModule(pl.LightningModule):
         # 2. Soft Loss (KL divergence entre outputs suavizados)
         student_soft = F.log_softmax(student_logits / self.temperature, dim=1)
         teacher_soft = F.softmax(teacher_logits / self.temperature, dim=1)
+        # El target para KLDivLoss es `teacher_soft` (probabilidades), el input es `student_soft` (log-probabilidades) 
         loss_soft = self.soft_loss(student_soft, teacher_soft) * (self.temperature ** 2)
         
         # 3. Feature Loss (MSE entre embeddings)
-        s = student_embeddings  # e.g. (B, latent_dim) o (B,C,H,W)
-        t = teacher_embeddings  # e.g. (B, teacher_feat_dim) o (B,C,H,W)
-        
-        # Si shapes ya coinciden, OK
-        if s.shape != t.shape:
-            # Caso embeddings 2D (B, C) -> usar Linear projection teacher->student
-            if s.dim() == 2 and t.dim() == 2 and s.shape[1] != t.shape[1]:
-                # crear o re-configurar teacher_proj dinámicamente si hace falta
-                if (getattr(self, "teacher_proj", None) is None
-                        or getattr(self.teacher_proj, "in_features", None) != t.shape[1]
-                        or getattr(self.teacher_proj, "out_features", None) != s.shape[1]):
-                    # crear y registrar proyección linear
-                    self.teacher_proj = nn.Linear(t.shape[1], s.shape[1], bias=False).to(self.device)
-                # mover a device correcto y proyectar
-                if next(self.teacher_proj.parameters()).device != s.device:
-                    self.teacher_proj.to(s.device)
-                t = self.teacher_proj(t)
-            
-            # Caso embeddings espaciales (B, C, H, W) -> usar Conv2d 1x1
-            elif s.dim() == 4 and t.dim() == 4 and s.shape[1] != t.shape[1]:
-                # crear o re-configurar feature_proj (Conv1x1)
-                if (getattr(self, "feature_proj", None) is None
-                        or self.feature_proj.in_channels != t.shape[1]
-                        or self.feature_proj.out_channels != s.shape[1]):
-                    self.feature_proj = nn.Conv2d(t.shape[1], s.shape[1], kernel_size=1, bias=False).to(self.device)
-                if next(self.feature_proj.parameters()).device != s.device:
-                    self.feature_proj.to(s.device)
-                t = self.feature_proj(t)
-            
-            # Otros casos: intentar flattenar/average pool teacher si student es vector y teacher tiene mapa
-            elif s.dim() == 2 and t.dim() == 4:
-                # global average pool teacher -> (B, C)
-                t_pooled = torch.flatten(torch.mean(t, dim=[2,3]), 1)
-                if t_pooled.shape[1] != s.shape[1]:
-                    # crear proy linear si hace falta
-                    if (getattr(self, "teacher_proj", None) is None
-                            or getattr(self.teacher_proj, "in_features", None) != t_pooled.shape[1]
-                            or getattr(self.teacher_proj, "out_features", None) != s.shape[1]):
-                        self.teacher_proj = nn.Linear(t_pooled.shape[1], s.shape[1], bias=False).to(self.device)
-                    if next(self.teacher_proj.parameters()).device != s.device:
-                        self.teacher_proj.to(s.device)
-                    t = self.teacher_proj(t_pooled)
-                else:
-                    t = t_pooled.to(s.device)
-            
-            else:
-                # Si no se puede alinear explícitamente, lanzar error informativo
-                raise RuntimeError(f"Cannot align student embeddings shape {s.shape} with teacher embeddings shape {t.shape}")
-        
-        # En este punto s and t deben tener la misma shape
-        loss_feature = self.feature_loss(s, t)
-        
+
+        # Proyectar embeddings del teacher para que coincidan con la dimension del student   
+        if self.teacher_proj is not None:
+            teacher_embeddings = self.teacher_proj(teacher_embeddings)
+        loss_feature = self.feature_loss(student_embeddings, teacher_embeddings) 
         # Loss total ponderado
         total_loss = (self.alpha * loss_hard + 
                      self.beta * loss_soft + 
                      self.gamma * loss_feature)
         
-        # Devolver también componentes para logging (floats)
+        # Devolver también componentes para logging ()
         losses_dict = {
-            'hard': loss_hard.item() if isinstance(loss_hard, torch.Tensor) else float(loss_hard),
-            'soft': loss_soft.item() if isinstance(loss_soft, torch.Tensor) else float(loss_soft),
-            'feature': loss_feature.item() if isinstance(loss_feature, torch.Tensor) else float(loss_feature),
-            'total': total_loss.item() if isinstance(total_loss, torch.Tensor) else float(total_loss)
+            'hard': loss_hard.item(),
+            'soft': loss_soft.item(),
+            'feature': loss_feature.item(),
+            'total': total_loss.item()
         }
         
         return total_loss, losses_dict

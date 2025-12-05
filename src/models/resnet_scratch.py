@@ -37,7 +37,23 @@ class ResNetScratchModule(pl.LightningModule):
         self.max_epochs = max_epochs
     
     def _build_resnet(self, num_classes, latent_dim, dropout):
-        """Construir ResNet-18 personalizado."""
+        """Construir el modelo CustomResNet basado en las especificaciones."""
+        from src.models.custom_resnet import CustomResNet
+        model = CustomResNet(
+             num_classes=num_classes,
+             latent_dim=latent_dim,
+             dropout=dropout
+        )
+        
+         # La referencia a la capa de embedding  se encuentra en CustomResNet
+        self.embedding_layer = model.embedding_layer
+        return model
+    
+
+#Old version 
+    """
+    def _build_resnet(self, num_classes, latent_dim, dropout):
+       
         from torchvision.models import resnet18
         
         # Base ResNet-18 sin pretrained
@@ -60,51 +76,33 @@ class ResNetScratchModule(pl.LightningModule):
         
         return model
     
+    """
     def _setup_loss(self, loss_config):
         """Configurar función de pérdida."""
         if loss_config is None or loss_config.name == "cross_entropy":
             label_smoothing = loss_config.get('label_smoothing', 0.0) if loss_config else 0.0
             weight = loss_config.get('weight', None) if loss_config else None
-            
+            # Asegurarse de que el peso sea un tensor si se proporciona
+            if weight is not None and not isinstance(weight, torch.Tensor):
+                weight = torch.tensor(weight)
             self.criterion = nn.CrossEntropyLoss(
                 label_smoothing=label_smoothing,
-                weight=torch.tensor(weight) if weight else None
+                weight=weight
             )
         else:
             raise ValueError(f"Loss '{loss_config.name}' no soportado para modelo scratch")
     
+
+
     def forward(self, x):
         return self.model(x)
     
     def get_embeddings(self, x):
         """
-        Extraer embeddings (antes de la capa de clasificación).
-        
-        Args:
-            x: Tensor de imágenes (B, C, H, W)
-        
-        Returns:
-            embeddings: Tensor (B, latent_dim)
+        Extraer embeddings llamando al método del modelo encapsulado.
         """
-        # Forward hasta antes del clasificador
-        x = self.model.conv1(x)
-        x = self.model.bn1(x)
-        x = self.model.relu(x)
-        x = self.model.maxpool(x)
+        return self.model.get_embeddings(x)   
         
-        x = self.model.layer1(x)
-        x = self.model.layer2(x)
-        x = self.model.layer3(x)
-        x = self.model.layer4(x)
-        
-        x = self.model.avgpool(x)
-        x = torch.flatten(x, 1)
-        
-        # Pasar por primera parte del FC (hasta embedding)
-        x = self.model.fc[0](x)  # Dropout
-        embeddings = self.model.fc[1](x)  # Linear -> embedding
-        
-        return embeddings
     
     def training_step(self, batch, batch_idx):
         # Desempaquetar batch - puede tener 2 o 3 valores
