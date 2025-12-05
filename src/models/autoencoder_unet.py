@@ -4,9 +4,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Optional, List, Tuple
 from omegaconf import DictConfig
-
-# --- Bloques Constructivos (Portados del Notebook) ---
-
 class UNetEncoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -45,8 +42,6 @@ class UNetDecoderBlock(nn.Module):
         x = torch.cat([x, skip], dim=1)
         return self.block(x)
 
-
-# --- Utilidades para Loss (SSIM) ---
 
 class SSIMLoss(nn.Module):
     def __init__(self, window_size=11, sigma=1.5, data_range=1.0, channel=3, K1=0.01, K2=0.03):
@@ -96,8 +91,6 @@ class SSIMLoss(nn.Module):
         ssim_map = num / (den + 1e-8)
         return 1 - ssim_map.mean()
 
-
-# --- Módulo Principal ---
 
 class UNetAutoencoderModule(pl.LightningModule):
     """
@@ -247,17 +240,12 @@ class UNetAutoencoderModule(pl.LightningModule):
         Extrae los embeddings del bottleneck.
         Útil para visualización (PCA/t-SNE) o detección de anomalías.
         """
-        # 1. Pasar por el Encoder (igual que en forward)
         out = x
         for enc, down in zip(self.enc_blocks, self.downsamples):
             out = enc(out)
             out = down(out)
 
-        # 2. Pasar por el Bottleneck
         out = self.bottleneck(out)
-        
-        # 3. Aplanar: (Batch, Canales, H, W) -> (Batch, Vector)
-        # Esto convierte el mapa de características 3D en un vector de embeddings 1D
         embeddings = torch.flatten(out, 1)
         
         return embeddings
@@ -266,12 +254,9 @@ class UNetAutoencoderModule(pl.LightningModule):
         """Configuración robusta del optimizador (copiada del estilo de ResNetDistilled)."""
         cfg = self.optimizer_config
         if cfg is None:
-            # Fallback simple
             return torch.optim.Adam(self.parameters(), lr=1e-3)
 
         params = self.parameters()
-
-        # Selección de Optimizador
         if cfg.name == 'adam':
             optimizer = torch.optim.Adam(
                 params,
@@ -295,7 +280,6 @@ class UNetAutoencoderModule(pl.LightningModule):
         else:
             raise ValueError(f"Optimizer '{cfg.name}' no soportado")
 
-        # Configuración de Scheduler (Opcional)
         if not cfg.get('scheduler', {}).get('enabled', False):
             return optimizer
 

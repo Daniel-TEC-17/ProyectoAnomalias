@@ -1,32 +1,19 @@
 import os
-
-# --- CORRECCIÓN CRÍTICA PARA CRASH EN WINDOWS ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
-# ------------------------------------------------
-
-import torch
-import numpy as np
-# ... resto de imports ...
 
 import torch
 import numpy as np
 import wandb
 import matplotlib.pyplot as plt
 from pathlib import Path
-from sklearn.manifold import TSNE
-import seaborn as sns
-import pandas as pd
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
 
-# ==============================================================================
-# CALLBACK 1: RECONSTRUCCIÓN DE IMÁGENES (Ya lo tenías)
-# ==============================================================================
 class ImageReconstructionLogger(pl.Callback):
     """
     Loguea reconstrucciones de imágenes fijas (una por cada clase de MVTec) en WandB.
@@ -35,27 +22,22 @@ class ImageReconstructionLogger(pl.Callback):
     def __init__(self, num_samples=10):
         super().__init__()
         self.num_samples = num_samples
-        self.val_images = None  # Cache para las imágenes fijas
-        # Las 10 clases de MVTec
+        self.val_images = None  
         self.target_classes = [
             "cable", "capsule", "grid", "hazelnut", "leather", 
             "metal_nut", "pill", "screw", "tile", "transistor"
         ]
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        # Solo ejecutar si es un autoencoder (tiene decoder)
         if not (hasattr(pl_module, 'decoder') or hasattr(pl_module, 'dec_blocks')):
             return
 
-        # 1. Seleccionar imágenes fijas la primera vez (para que sean siempre las mismas)
         if self.val_images is None:
             self.val_images = self._select_diverse_images(trainer, pl_module)
         
         if self.val_images is None:
             return 
 
-        # 2. Reconstruir
-        # Mover a dispositivo
         images = self.val_images.to(pl_module.device)
         
         with torch.no_grad():
@@ -63,7 +45,6 @@ class ImageReconstructionLogger(pl.Callback):
             reconstructions = pl_module(images)
             pl_module.train()
 
-        # 3. Loguear
         self._log_images(trainer, images, reconstructions)
 
     def _select_diverse_images(self, trainer, pl_module):
@@ -72,35 +53,27 @@ class ImageReconstructionLogger(pl.Callback):
             val_loader = trainer.datamodule.val_dataloader()
             dataset = val_loader.dataset
             
-            # Manejar Subsets (común cuando se usa random_split)
             indices = list(range(len(dataset)))
             source_dataset = dataset
             if hasattr(dataset, 'indices'):
                 indices = dataset.indices
                 source_dataset = dataset.dataset
-            
-            # Buscar una imagen por clase
+
             selected_indices = []
             found_classes = set()
-            
-            # Verificar si podemos acceder a los paths (común en MVTecDataset custom)
+
             if hasattr(source_dataset, 'image_paths'):
                 paths = source_dataset.image_paths
                 for idx in indices:
-                    # Obtener path
                     path = str(paths[idx]).lower()
-                    # Verificar a qué clase pertenece
                     for cls in self.target_classes:
                         if cls in path and cls not in found_classes:
                             selected_indices.append(idx)
                             found_classes.add(cls)
                             break
-                    # Si ya tenemos las 10, paramos
                     if len(found_classes) >= len(self.target_classes):
                         break
-            
-            # Si no encontramos suficientes (o el dataset no tiene image_paths accesible)
-            # Rellenamos con las primeras disponibles para llegar a num_samples
+        
             if len(selected_indices) < self.num_samples:
                 print(f"⚠️ ImageReconstructionLogger: Solo se encontraron clases: {list(found_classes)}")
                 for idx in indices:
@@ -109,20 +82,16 @@ class ImageReconstructionLogger(pl.Callback):
                     if len(selected_indices) >= self.num_samples:
                         break
             
-            # Cargar los tensores de las imágenes seleccionadas
             batch_images = []
             for idx in selected_indices:
                 item = source_dataset[idx]
-                # El dataset puede devolver (img, label) o solo img
                 img = item[0] if isinstance(item, (tuple, list)) else item
                 batch_images.append(img)
-            
-            # Convertir a un solo tensor batch
+
             return torch.stack(batch_images)
 
         except Exception as e:
             print(f"⚠️ Error seleccionando imágenes diversas: {e}. Usando batch aleatorio.")
-            # Fallback: tomar el primer batch del loader
             batch = next(iter(val_loader))
             images = batch[0] if isinstance(batch, (list, tuple)) else batch
             return images[:self.num_samples]
@@ -133,28 +102,20 @@ class ImageReconstructionLogger(pl.Callback):
         
         log_images = []
         for i, (orig, recon) in enumerate(zip(images, reconstructions)):
-            # Formato (C, H, W) -> (H, W, C) para visualización
             orig = np.transpose(orig, (1, 2, 0))
             recon = np.transpose(recon, (1, 2, 0))
             
-            # Concatenar lado a lado
             combined = np.concatenate((orig, recon), axis=1)
             combined = np.clip(combined, 0, 1)
             
-            # Título dinámico
             caption = f"Muestra {i+1}"
             if i < len(self.target_classes):
-                # Si logramos ordenarlos, intentamos adivinar el nombre (solo visual)
-                # Nota: esto asume que _select_diverse_images encontró en orden, si no, es solo indicativo
                 pass 
 
             log_images.append(wandb.Image(combined, caption=caption))
 
         trainer.logger.experiment.log({"val/reconstructions": log_images})
 
-# ==============================================================================
-# CALLBACK 2: ANÁLISIS DE OVERFITTING (Train vs Val Loss) - CORRECCIÓN 2
-# ==============================================================================
 class OverfittingCurveCallback(pl.Callback):
     """
     Genera una gráfica comparativa de Train vs Val loss al final del entrenamiento.
@@ -166,8 +127,6 @@ class OverfittingCurveCallback(pl.Callback):
         self.val_loss_history = []
 
     def on_train_epoch_end(self, trainer, pl_module):
-        # Intentar obtener métricas logueadas. 
-        # Nota: 'train/loss' debe ser logueado con on_epoch=True en el modelo
         metrics = trainer.callback_metrics
         if 'train/loss' in metrics:
             self.train_loss_history.append(metrics['train/loss'].item())
@@ -182,11 +141,9 @@ class OverfittingCurveCallback(pl.Callback):
             self.val_loss_history.append(metrics['val_loss'].item())
 
     def on_fit_end(self, trainer, pl_module):
-        # Verificar que tengamos datos
         if len(self.train_loss_history) == 0 or len(self.val_loss_history) == 0:
             return
 
-        # Ajustar longitudes (a veces val corre una vez más o menos que train)
         min_len = min(len(self.train_loss_history), len(self.val_loss_history))
         epochs = range(1, min_len + 1)
 
@@ -202,7 +159,6 @@ class OverfittingCurveCallback(pl.Callback):
         
         plt.tight_layout()
         
-        # Loguear a WandB
         trainer.logger.experiment.log({"analysis/overfitting_curve": wandb.Image(fig)})
         plt.close(fig)
 """
@@ -311,16 +267,12 @@ class TSNEVisualizerCallback(pl.Callback):
                 
 """
 
-# ==============================================================================
-# FUNCIÓN DE ENTRENAMIENTO PRINCIPAL
-# ==============================================================================
 
 def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
     """
     Entrenar modelo con configuración de Hydra.
     """
     
-    # 1. CREAR MODELO
     if model_type == "scratch":
         from src.models.resnet_scratch import ResNetScratchModule
         model = ResNetScratchModule(
@@ -366,7 +318,6 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
         raise ValueError(f"Unknown model_type: {model_type}")
     
     
-    # 2. CONFIGURAR LOGGER
     if cfg.experiment.run_name:
         run_name = cfg.experiment.run_name
     else:
@@ -384,8 +335,6 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
     )
     wandb_logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     
-    
-    # 3. CONFIGURAR CALLBACKS (ACTUALIZADO)
     checkpoint_dir = Path(f'./checkpoints/{run_name}')
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
@@ -406,18 +355,13 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
             verbose=True
         ),
         LearningRateMonitor(logging_interval='epoch'),
-        
-        # --- NUEVOS CALLBACKS SOLICITADOS ---
-        OverfittingCurveCallback(),  # Gráfica Train vs Val
-        # TSNEVisualizerCallback(max_samples=1000) # t-SNE coloreado por clase
+        OverfittingCurveCallback(),  
     ]
 
-    # Callback específico solo para Autoencoder (Reconstrucción visual)
     if model_type == "autoencoder":
         callbacks.append(ImageReconstructionLogger(num_samples=4))
     
     
-    # 4. TRAINER
     trainer = pl.Trainer(
         max_epochs=cfg.model.max_epochs,
         accelerator=cfg.trainer.accelerator,
@@ -430,13 +374,11 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
         deterministic=True
     )
     
-    # 5. ENTRENAMIENTO
     print(f"\n=== INICIANDO ENTRENAMIENTO: {run_name} ===")
     trainer.fit(model, datamodule)
     
     print("\n=== ENTRENAMIENTO COMPLETADO ===")
     
-    # 6. TEST (Importante para generar el t-SNE final)
     print("\n=== EJECUTANDO TEST & T-SNE ===")
     trainer.test(model, datamodule)
     
@@ -444,8 +386,6 @@ def train_model(cfg: DictConfig, datamodule, model_type: str = "scratch"):
     
     return trainer, model
 
-
-# UTILS DE CARGA (Sin cambios mayores, solo soporte de imports)
 def load_trained_model(checkpoint_path: str, model_type: str = "scratch"):
     if model_type == "scratch":
         from src.models.resnet_scratch import ResNetScratchModule
